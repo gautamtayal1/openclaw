@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import OSLog
 import Security
@@ -227,9 +228,16 @@ enum ExecApprovalsStore {
     private static let defaultAskFallback: ExecSecurity = .deny
     private static let defaultAutoAllowSkills = false
     private static let secureStateDirPermissions = 0o700
+    private static let lockTimeoutSeconds: TimeInterval = 5
+    private static let staleLockSeconds: TimeInterval = 30
+    private static let lockRetryMicros: useconds_t = 25_000
 
     static func fileURL() -> URL {
         OpenClawPaths.stateDirURL.appendingPathComponent("exec-approvals.json")
+    }
+
+    static func lockURL() -> URL {
+        self.fileURL().appendingPathExtension("lock")
     }
 
     static func socketPath() -> String {
@@ -345,6 +353,12 @@ enum ExecApprovalsStore {
     }
 
     static func ensureFile() -> ExecApprovalsFile {
+        self.withFileLock {
+            self.ensureFileUnlocked()
+        } ?? ExecApprovalsFile(version: 1, socket: nil, defaults: nil, agents: [:])
+    }
+
+    static func ensureFileUnlocked() -> ExecApprovalsFile {
         self.ensureSecureStateDirectory()
         let url = self.fileURL()
         let existed = FileManager().fileExists(atPath: url.path)
@@ -522,9 +536,11 @@ enum ExecApprovalsStore {
     }
 
     private static func updateFile(_ mutate: (inout ExecApprovalsFile) -> Void) {
-        var file = self.ensureFile()
-        mutate(&file)
-        self.saveFile(file)
+        _ = self.withFileLock {
+            var file = self.ensureFileUnlocked()
+            mutate(&file)
+            self.saveFile(file)
+        }
     }
 
     private static func ensureSecureStateDirectory() {
@@ -541,6 +557,55 @@ enum ExecApprovalsStore {
                 .warning(
                     "\(message, privacy: .public)")
         }
+    }
+
+    private static func withFileLock<T>(_ body: () -> T) -> T? {
+        self.ensureSecureStateDirectory()
+        let lockURL = self.lockURL()
+        let deadline = Date().addingTimeInterval(self.lockTimeoutSeconds)
+
+        while true {
+            let fd = open(lockURL.path, O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR)
+            if fd >= 0 {
+                let payload = "\(getpid()) \(Date().timeIntervalSince1970)\n"
+                payload.withCString { pointer in
+                    _ = write(fd, pointer, strlen(pointer))
+                }
+                defer {
+                    _ = close(fd)
+                    try? FileManager().removeItem(at: lockURL)
+                }
+                return body()
+            }
+
+            if errno != EEXIST {
+                let message = String(cString: strerror(errno))
+                self.logger.error("exec approvals lock failed: \(message, privacy: .public)")
+                return nil
+            }
+
+            // The gateway and mac app can both mutate the host-local approvals
+            // file, so only clear locks that look orphaned by age.
+            self.removeStaleLockIfNeeded(at: lockURL)
+            if Date() >= deadline {
+                self.logger.error("exec approvals lock timed out: \(lockURL.path, privacy: .public)")
+                return nil
+            }
+            usleep(self.lockRetryMicros)
+        }
+    }
+
+    private static func removeStaleLockIfNeeded(at url: URL) {
+        guard
+            let attrs = try? FileManager().attributesOfItem(atPath: url.path),
+            let modifiedAt = attrs[.modificationDate] as? Date
+        else {
+            return
+        }
+        guard Date().timeIntervalSince(modifiedAt) >= self.staleLockSeconds else {
+            return
+        }
+        try? FileManager().removeItem(at: url)
     }
 
     private static func generateToken() -> String {

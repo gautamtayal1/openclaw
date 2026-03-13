@@ -143,6 +143,11 @@ export type ExecApprovalsResolved = {
   file: ExecApprovalsFile;
 };
 
+type ExecApprovalsFileLockPayload = {
+  pid: number;
+  createdAt: string;
+};
+
 // Keep CLI + gateway defaults in sync.
 export const DEFAULT_EXEC_APPROVAL_TIMEOUT_MS = 120_000;
 
@@ -152,6 +157,12 @@ const DEFAULT_ASK_FALLBACK: ExecSecurity = "deny";
 const DEFAULT_AUTO_ALLOW_SKILLS = false;
 const DEFAULT_SOCKET = "~/.openclaw/exec-approvals.sock";
 const DEFAULT_FILE = "~/.openclaw/exec-approvals.json";
+const EXEC_APPROVALS_FILE_MODE = 0o600;
+const EXEC_APPROVALS_FILE_LOCK_OPTIONS = {
+  timeoutMs: 5_000,
+  staleMs: 30_000,
+  retryMs: 25,
+} as const;
 
 function hashExecApprovalsRaw(raw: string | null): string {
   return crypto
@@ -206,6 +217,135 @@ function mergeLegacyAgent(
 function ensureDir(filePath: string) {
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true });
+}
+
+function resolveExecApprovalsLockPath(): string {
+  const filePath = resolveExecApprovalsPath();
+  return `${filePath}.lock`;
+}
+
+function sleepSync(ms: number) {
+  if (ms <= 0) {
+    return;
+  }
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function closeFileSync(fd: number | undefined) {
+  if (fd === undefined) {
+    return;
+  }
+  try {
+    fs.closeSync(fd);
+  } catch {
+    // best-effort cleanup
+  }
+}
+
+function removeFileSync(filePath: string) {
+  try {
+    fs.rmSync(filePath, { force: true });
+  } catch {
+    // best-effort cleanup
+  }
+}
+
+function setFileModeSync(filePath: string) {
+  try {
+    fs.chmodSync(filePath, EXEC_APPROVALS_FILE_MODE);
+  } catch {
+    // best-effort on platforms without chmod
+  }
+}
+
+function readExecApprovalsFileLockPayload(lockPath: string): ExecApprovalsFileLockPayload | null {
+  try {
+    const raw = fs.readFileSync(lockPath, "utf8");
+    const payload = JSON.parse(raw) as Partial<ExecApprovalsFileLockPayload>;
+    if (typeof payload.pid !== "number" || typeof payload.createdAt !== "string") {
+      return null;
+    }
+    return {
+      pid: payload.pid,
+      createdAt: payload.createdAt,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function isStaleExecApprovalsFileLock(lockPath: string): boolean {
+  const payload = readExecApprovalsFileLockPayload(lockPath);
+  if (payload?.createdAt) {
+    const createdAt = Date.parse(payload.createdAt);
+    if (!Number.isFinite(createdAt)) {
+      return true;
+    }
+    if (Date.now() - createdAt > EXEC_APPROVALS_FILE_LOCK_OPTIONS.staleMs) {
+      return true;
+    }
+  }
+  try {
+    const stat = fs.statSync(lockPath);
+    return Date.now() - stat.mtimeMs > EXEC_APPROVALS_FILE_LOCK_OPTIONS.staleMs;
+  } catch {
+    return true;
+  }
+}
+
+function withExecApprovalsFileLock<T>(fn: () => T): T {
+  const lockPath = resolveExecApprovalsLockPath();
+  ensureDir(lockPath);
+  const deadline = Date.now() + EXEC_APPROVALS_FILE_LOCK_OPTIONS.timeoutMs;
+
+  while (true) {
+    try {
+      const fd = fs.openSync(
+        lockPath,
+        fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY,
+        EXEC_APPROVALS_FILE_MODE,
+      );
+      try {
+        const payload: ExecApprovalsFileLockPayload = {
+          pid: process.pid,
+          createdAt: new Date().toISOString(),
+        };
+        fs.writeFileSync(fd, JSON.stringify(payload, null, 2), "utf8");
+        return fn();
+      } finally {
+        closeFileSync(fd);
+        removeFileSync(lockPath);
+      }
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (code !== "EEXIST") {
+        throw err;
+      }
+      if (isStaleExecApprovalsFileLock(lockPath)) {
+        removeFileSync(lockPath);
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for exec approvals lock: ${lockPath}`, { cause: err });
+      }
+      sleepSync(EXEC_APPROVALS_FILE_LOCK_OPTIONS.retryMs);
+    }
+  }
+}
+
+function writeExecApprovalsFile(file: ExecApprovalsFile) {
+  const filePath = resolveExecApprovalsPath();
+  ensureDir(filePath);
+  const payload = `${JSON.stringify(file, null, 2)}\n`;
+  const tmpPath = `${filePath}.${crypto.randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(tmpPath, payload, { mode: EXEC_APPROVALS_FILE_MODE });
+    setFileModeSync(tmpPath);
+    fs.renameSync(tmpPath, filePath);
+    setFileModeSync(filePath);
+  } finally {
+    removeFileSync(tmpPath);
+  }
 }
 
 // Coerce legacy/corrupted allowlists into `ExecAllowlistEntry[]` before we spread
@@ -362,30 +502,27 @@ export function loadExecApprovals(): ExecApprovalsFile {
 }
 
 export function saveExecApprovals(file: ExecApprovalsFile) {
-  const filePath = resolveExecApprovalsPath();
-  ensureDir(filePath);
-  fs.writeFileSync(filePath, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600 });
-  try {
-    fs.chmodSync(filePath, 0o600);
-  } catch {
-    // best-effort on platforms without chmod
-  }
+  withExecApprovalsFileLock(() => {
+    writeExecApprovalsFile(file);
+  });
 }
 
 export function ensureExecApprovals(): ExecApprovalsFile {
-  const loaded = loadExecApprovals();
-  const next = normalizeExecApprovals(loaded);
-  const socketPath = next.socket?.path?.trim();
-  const token = next.socket?.token?.trim();
-  const updated: ExecApprovalsFile = {
-    ...next,
-    socket: {
-      path: socketPath && socketPath.length > 0 ? socketPath : resolveExecApprovalsSocketPath(),
-      token: token && token.length > 0 ? token : generateToken(),
-    },
-  };
-  saveExecApprovals(updated);
-  return updated;
+  return withExecApprovalsFileLock(() => {
+    const loaded = loadExecApprovals();
+    const next = normalizeExecApprovals(loaded);
+    const socketPath = next.socket?.path?.trim();
+    const token = next.socket?.token?.trim();
+    const updated: ExecApprovalsFile = {
+      ...next,
+      socket: {
+        path: socketPath && socketPath.length > 0 ? socketPath : resolveExecApprovalsSocketPath(),
+        token: token && token.length > 0 ? token : generateToken(),
+      },
+    };
+    writeExecApprovalsFile(updated);
+    return updated;
+  });
 }
 
 function normalizeSecurity(value: ExecSecurity | undefined, fallback: ExecSecurity): ExecSecurity {
@@ -496,52 +633,62 @@ export function requiresExecApproval(params: {
 }
 
 export function recordAllowlistUse(
-  approvals: ExecApprovalsFile,
+  _approvals: ExecApprovalsFile,
   agentId: string | undefined,
   entry: ExecAllowlistEntry,
   command: string,
   resolvedPath?: string,
 ) {
-  const target = agentId ?? DEFAULT_AGENT_ID;
-  const agents = approvals.agents ?? {};
-  const existing = agents[target] ?? {};
-  const allowlist = Array.isArray(existing.allowlist) ? existing.allowlist : [];
-  const nextAllowlist = allowlist.map((item) =>
-    item.pattern === entry.pattern
-      ? {
-          ...item,
-          id: item.id ?? crypto.randomUUID(),
-          lastUsedAt: Date.now(),
-          lastUsedCommand: command,
-          lastResolvedPath: resolvedPath,
-        }
-      : item,
-  );
-  agents[target] = { ...existing, allowlist: nextAllowlist };
-  approvals.agents = agents;
-  saveExecApprovals(approvals);
+  withExecApprovalsFileLock(() => {
+    const approvals = loadExecApprovals();
+    const target = agentId ?? DEFAULT_AGENT_ID;
+    const agents = approvals.agents ?? {};
+    const existing = agents[target] ?? {};
+    const allowlist = Array.isArray(existing.allowlist) ? existing.allowlist : [];
+    const now = Date.now();
+    const nextAllowlist = allowlist.map((item) =>
+      item.pattern === entry.pattern
+        ? {
+            ...item,
+            id: item.id ?? crypto.randomUUID(),
+            lastUsedAt: now,
+            lastUsedCommand: command,
+            lastResolvedPath: resolvedPath,
+          }
+        : item,
+    );
+    if (!nextAllowlist.some((item, index) => item !== allowlist[index])) {
+      return;
+    }
+    agents[target] = { ...existing, allowlist: nextAllowlist };
+    approvals.agents = agents;
+    writeExecApprovalsFile(approvals);
+  });
 }
 
 export function addAllowlistEntry(
-  approvals: ExecApprovalsFile,
+  _approvals: ExecApprovalsFile,
   agentId: string | undefined,
   pattern: string,
 ) {
-  const target = agentId ?? DEFAULT_AGENT_ID;
-  const agents = approvals.agents ?? {};
-  const existing = agents[target] ?? {};
-  const allowlist = Array.isArray(existing.allowlist) ? existing.allowlist : [];
-  const trimmed = pattern.trim();
-  if (!trimmed) {
-    return;
-  }
-  if (allowlist.some((entry) => entry.pattern === trimmed)) {
-    return;
-  }
-  allowlist.push({ id: crypto.randomUUID(), pattern: trimmed, lastUsedAt: Date.now() });
-  agents[target] = { ...existing, allowlist };
-  approvals.agents = agents;
-  saveExecApprovals(approvals);
+  withExecApprovalsFileLock(() => {
+    const approvals = loadExecApprovals();
+    const target = agentId ?? DEFAULT_AGENT_ID;
+    const agents = approvals.agents ?? {};
+    const existing = agents[target] ?? {};
+    const allowlist = Array.isArray(existing.allowlist) ? existing.allowlist : [];
+    const trimmed = pattern.trim();
+    if (!trimmed) {
+      return;
+    }
+    if (allowlist.some((entry) => entry.pattern === trimmed)) {
+      return;
+    }
+    allowlist.push({ id: crypto.randomUUID(), pattern: trimmed, lastUsedAt: Date.now() });
+    agents[target] = { ...existing, allowlist };
+    approvals.agents = agents;
+    writeExecApprovalsFile(approvals);
+  });
 }
 
 export function minSecurity(a: ExecSecurity, b: ExecSecurity): ExecSecurity {
